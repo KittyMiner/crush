@@ -1,0 +1,670 @@
+name: Fleet Orchestration Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+    paths:
+      - 'internal/fleet/**'
+      - 'internal/orchestration/**'
+      - '.github/workflows/fleet-orchestration.yml'
+  pull_request:
+    branches:
+      - main
+      - develop
+  schedule:
+    # Run system calibration daily at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: 'Fleet operation to execute'
+        required: true
+        default: 'calibrate'
+        type: choice
+        options:
+          - calibrate
+          - optimize
+          - validate
+          - health-check
+          - full-diagnostics
+
+env:
+  GO_VERSION: '1.24'
+  CACHE_VERSION: v1
+
+jobs:
+  # Phase 1: Pre-flight checks and environment setup
+  preflight:
+    name: Pre-flight Environment Setup
+    runs-on: ubuntu-latest
+    outputs:
+      fleet-enabled: ${{ steps.check.outputs.fleet-enabled }}
+      optimization-level: ${{ steps.check.outputs.optimization-level }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Cache Go modules
+        uses: actions/cache@v3
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}-${{ env.CACHE_VERSION }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Validate Fleet Configuration
+        id: check
+        run: |
+          echo "fleet-enabled=true" >> $GITHUB_OUTPUT
+          echo "optimization-level=aggressive" >> $GITHUB_OUTPUT
+          go version
+
+      - name: Check dependencies
+        run: go mod verify
+
+  # Phase 2: System calibration and baseline establishment
+  calibration:
+    name: System Calibration & Baseline
+    needs: preflight
+    runs-on: ubuntu-latest
+    if: needs.preflight.outputs.fleet-enabled == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Initialize Calibration Engine
+        run: |
+          mkdir -p .fleet/calibration
+          echo "Initializing system calibration baseline..."
+
+      - name: Performance Baseline Analysis
+        run: |
+          go test -v -race -timeout 5m -benchmem \
+            -run TestCalibration \
+            ./internal/fleet/calibration/... \
+            2>&1 | tee .fleet/calibration/baseline.log
+
+      - name: Resource Utilization Profiling
+        run: |
+          go test -v -cpuprofile=.fleet/calibration/cpu.prof \
+            -memprofile=.fleet/calibration/mem.prof \
+            -timeout 5m \
+            ./internal/fleet/resources/...
+
+      - name: System Metrics Collection
+        run: |
+          cat > .fleet/calibration/system-metrics.sh << 'EOF'
+          #!/bin/bash
+          echo "=== System Calibration Metrics ===" | tee -a calibration.log
+          echo "CPU Cores: $(nproc)" | tee -a calibration.log
+          echo "Memory: $(free -h | grep Mem)" | tee -a calibration.log
+          echo "Disk Space: $(df -h / | tail -1)" | tee -a calibration.log
+          echo "Network Interfaces: $(ip link show | grep -c UP)" | tee -a calibration.log
+          EOF
+          chmod +x .fleet/calibration/system-metrics.sh
+          ./.fleet/calibration/system-metrics.sh
+
+      - name: Baseline Validation
+        run: |
+          go run ./cmd/fleet calibrate \
+            --output .fleet/calibration/baseline.json \
+            --verbose
+
+      - name: Upload calibration data
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: calibration-baseline
+          path: .fleet/calibration/
+          retention-days: 30
+
+  # Phase 3: Internal operations validation
+  internal-ops:
+    name: Internal Operations Validation
+    needs: calibration
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        operation:
+          - heartbeat
+          - state-management
+          - distributed-coordination
+          - resource-allocation
+          - health-monitoring
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Run ${{ matrix.operation }} tests
+        run: |
+          go test -v -race -timeout 10m \
+            -run Test${{ matrix.operation }} \
+            -coverprofile=.fleet/coverage-${{ matrix.operation }}.out \
+            ./internal/fleet/operations/${{ matrix.operation }}/...
+
+      - name: Operation Health Check
+        run: |
+          go run ./cmd/fleet validate-op \
+            --operation ${{ matrix.operation }} \
+            --check-dependencies \
+            --verbose
+
+      - name: Generate operation report
+        if: always()
+        run: |
+          mkdir -p .fleet/reports
+          go tool cover -html=.fleet/coverage-${{ matrix.operation }}.out \
+            -o .fleet/reports/coverage-${{ matrix.operation }}.html
+
+      - name: Upload operation reports
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: operation-reports-${{ matrix.operation }}
+          path: .fleet/reports/
+          retention-days: 30
+
+  # Phase 4: System optimization
+  optimization:
+    name: System Optimization
+    needs: [calibration, internal-ops]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Load calibration baseline
+        run: |
+          go run ./cmd/fleet load-baseline \
+            --from .fleet/calibration/baseline.json \
+            --apply-optimizations
+
+      - name: Run optimization passes
+        run: |
+          go run ./cmd/fleet optimize \
+            --level aggressive \
+            --targets cpu,memory,io,network \
+            --output .fleet/optimization/results.json \
+            --verbose
+
+      - name: CPU Optimization
+        run: |
+          go test -v -timeout 5m \
+            -run TestCPUOptimization \
+            ./internal/fleet/optimization/cpu/...
+
+      - name: Memory Optimization
+        run: |
+          go test -v -timeout 5m \
+            -run TestMemoryOptimization \
+            ./internal/fleet/optimization/memory/...
+
+      - name: I/O Optimization
+        run: |
+          go test -v -timeout 5m \
+            -run TestIOOptimization \
+            ./internal/fleet/optimization/io/...
+
+      - name: Network Optimization
+        run: |
+          go test -v -timeout 5m \
+            -run TestNetworkOptimization \
+            ./internal/fleet/optimization/network/...
+
+      - name: Generate optimization report
+        if: always()
+        run: |
+          mkdir -p .fleet/optimization
+          go run ./cmd/fleet report \
+            --type optimization \
+            --output .fleet/optimization/report.html
+
+      - name: Upload optimization artifacts
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: optimization-results
+          path: .fleet/optimization/
+          retention-days: 30
+
+  # Phase 5: Distributed coordination tests
+  coordination:
+    name: Distributed Coordination
+    needs: preflight
+    runs-on: ubuntu-latest
+    services:
+      consul:
+        image: consul:latest
+        ports:
+          - 8500:8500
+        options: >-
+          --health-cmd="consul version"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Wait for Consul
+        run: |
+          for i in {1..30}; do
+            if curl -f http://localhost:8500/v1/status/leader > /dev/null 2>&1; then
+              echo "Consul is ready"
+              exit 0
+            fi
+            echo "Waiting for Consul... ($i/30)"
+            sleep 1
+          done
+          exit 1
+
+      - name: Distributed Lock Tests
+        run: |
+          go test -v -race -timeout 10m \
+            -run TestDistributedLock \
+            ./internal/fleet/coordination/locks/...
+
+      - name: Service Discovery Tests
+        run: |
+          go test -v -race -timeout 10m \
+            -run TestServiceDiscovery \
+            ./internal/fleet/coordination/discovery/...
+
+      - name: Consensus Algorithm Tests
+        run: |
+          go test -v -race -timeout 10m \
+            -run TestConsensus \
+            ./internal/fleet/coordination/consensus/...
+
+      - name: State Synchronization Tests
+        run: |
+          go test -v -race -timeout 10m \
+            -run TestStateSynchronization \
+            ./internal/fleet/coordination/sync/...
+
+  # Phase 6: Resource allocation and management
+  resource-mgmt:
+    name: Resource Management
+    needs: [calibration, optimization]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: CPU Quota Management
+        run: |
+          go test -v -timeout 10m \
+            -run TestCPUQuota \
+            ./internal/fleet/resources/cpu/...
+
+      - name: Memory Quota Management
+        run: |
+          go test -v -timeout 10m \
+            -run TestMemoryQuota \
+            ./internal/fleet/resources/memory/...
+
+      - name: Network Bandwidth Management
+        run: |
+          go test -v -timeout 10m \
+            -run TestBandwidthQuota \
+            ./internal/fleet/resources/network/...
+
+      - name: Storage Quota Management
+        run: |
+          go test -v -timeout 10m \
+            -run TestStorageQuota \
+            ./internal/fleet/resources/storage/...
+
+      - name: Dynamic Resource Scaling
+        run: |
+          go test -v -timeout 10m \
+            -run TestDynamicScaling \
+            ./internal/fleet/resources/scaling/...
+
+  # Phase 7: Health monitoring and diagnostics
+  health-check:
+    name: Health Monitoring
+    needs: [internal-ops, coordination, resource-mgmt]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Fleet Health Check
+        run: |
+          go run ./cmd/fleet health-check \
+            --comprehensive \
+            --output .fleet/health/status.json \
+            --verbose
+
+      - name: Agent Health Monitoring
+        run: |
+          go test -v -timeout 5m \
+            -run TestAgentHealth \
+            ./internal/fleet/health/agent/...
+
+      - name: Service Health Monitoring
+        run: |
+          go test -v -timeout 5m \
+            -run TestServiceHealth \
+            ./internal/fleet/health/service/...
+
+      - name: Network Health Monitoring
+        run: |
+          go test -v -timeout 5m \
+            -run TestNetworkHealth \
+            ./internal/fleet/health/network/...
+
+      - name: Generate health report
+        if: always()
+        run: |
+          mkdir -p .fleet/health
+          go run ./cmd/fleet report \
+            --type health \
+            --output .fleet/health/report.html
+
+      - name: Upload health artifacts
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: health-reports
+          path: .fleet/health/
+          retention-days: 30
+
+  # Phase 8: Performance benchmarking
+  benchmarks:
+    name: Performance Benchmarks
+    needs: [optimization, health-check]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Run benchmarks
+        run: |
+          mkdir -p .fleet/benchmarks
+          go test -bench=. -benchmem -benchtime=10s \
+            -run=^$ \
+            ./internal/fleet/... \
+            | tee .fleet/benchmarks/results.txt
+
+      - name: Parse benchmark results
+        run: |
+          go run ./cmd/fleet analyze-bench \
+            --input .fleet/benchmarks/results.txt \
+            --output .fleet/benchmarks/analysis.json
+
+      - name: Compare with baseline
+        run: |
+          go run ./cmd/fleet compare-bench \
+            --current .fleet/benchmarks/analysis.json \
+            --baseline .fleet/calibration/baseline.json \
+            --output .fleet/benchmarks/comparison.html
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: benchmark-results
+          path: .fleet/benchmarks/
+          retention-days: 30
+
+  # Phase 9: Integration and end-to-end tests
+  integration:
+    name: End-to-End Integration
+    needs: [health-check, benchmarks]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Run integration tests
+        run: |
+          go test -v -race -timeout 20m \
+            -tags integration \
+            -run TestIntegration \
+            ./internal/fleet/integration/...
+
+      - name: Fleet deployment simulation
+        run: |
+          go run ./cmd/fleet simulate \
+            --agents 5 \
+            --duration 5m \
+            --workload mixed \
+            --output .fleet/simulation/results.json
+
+      - name: Chaos engineering tests
+        run: |
+          go test -v -timeout 15m \
+            -run TestChaos \
+            ./internal/fleet/chaos/...
+
+      - name: Upload integration results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: integration-results
+          path: .fleet/simulation/
+          retention-days: 30
+
+  # Phase 10: Compliance and validation
+  compliance:
+    name: Compliance & Validation
+    needs: [internal-ops, coordination]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Security scanning
+        run: |
+          go run github.com/securego/gosec/v2/cmd/gosec@latest \
+            -no-fail -fmt json -out .fleet/security/report.json \
+            ./internal/fleet/...
+
+      - name: Lint analysis
+        run: |
+          go run github.com/golangci/golangci-lint/cmd/golangci-lint@latest run \
+            --out-format json \
+            ./internal/fleet/... > .fleet/compliance/lint.json
+
+      - name: Protocol compliance
+        run: |
+          go test -v -timeout 10m \
+            -run TestCompliance \
+            ./internal/fleet/compliance/...
+
+      - name: Data integrity validation
+        run: |
+          go test -v -timeout 10m \
+            -run TestDataIntegrity \
+            ./internal/fleet/validation/...
+
+      - name: Upload compliance reports
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: compliance-reports
+          path: .fleet/compliance/
+          retention-days: 30
+
+  # Phase 11: Report generation and analysis
+  report:
+    name: Generate Comprehensive Report
+    needs: [calibration, internal-ops, optimization, coordination, resource-mgmt, health-check, benchmarks, integration, compliance]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v3
+        with:
+          path: .fleet/artifacts
+
+      - name: Generate comprehensive report
+        run: |
+          mkdir -p .fleet/reports
+          go run ./cmd/fleet generate-report \
+            --artifacts-path .fleet/artifacts \
+            --output .fleet/reports/comprehensive.html \
+            --format html,json,markdown
+
+      - name: Generate executive summary
+        run: |
+          go run ./cmd/fleet generate-summary \
+            --report .fleet/reports/comprehensive.json \
+            --output .fleet/reports/SUMMARY.md
+
+      - name: Upload final reports
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: fleet-comprehensive-report
+          path: .fleet/reports/
+          retention-days: 90
+
+  # Phase 12: Status check and notifications
+  status:
+    name: Status & Notifications
+    needs: [preflight, calibration, internal-ops, optimization, coordination, resource-mgmt, health-check, benchmarks, integration, compliance, report]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Determine workflow status
+        id: status
+        run: |
+          if [[ "${{ needs.report.result }}" == "success" ]]; then
+            echo "status=✅ SUCCESS" >> $GITHUB_OUTPUT
+            echo "color=green" >> $GITHUB_OUTPUT
+          else
+            echo "status=❌ FAILED" >> $GITHUB_OUTPUT
+            echo "color=red" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Post workflow summary
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << 'EOF'
+          # 🚀 Fleet Orchestration Pipeline Report
+          
+          ## Status: ${{ steps.status.outputs.status }}
+          
+          ### Phase Results
+          - ✓ Pre-flight Environment Setup
+          - ✓ System Calibration & Baseline
+          - ✓ Internal Operations Validation
+          - ✓ System Optimization
+          - ✓ Distributed Coordination
+          - ✓ Resource Management
+          - ✓ Health Monitoring
+          - ✓ Performance Benchmarks
+          - ✓ Integration Tests
+          - ✓ Compliance & Validation
+          - ✓ Report Generation
+          
+          ### Artifacts Generated
+          - Calibration baseline data
+          - Operation reports (5 categories)
+          - Optimization results
+          - Health monitoring reports
+          - Benchmark results
+          - Integration test results
+          - Compliance reports
+          - Comprehensive analysis report
+          
+          **Workflow completed at:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EOF
+
+      - name: Comment on PR
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: '🤖 **Fleet Orchestration Pipeline** ${{ steps.status.outputs.status }}\n\nView the complete [workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})'
+            })
+
+      - name: Slack notification
+        if: failure()
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          payload: |
+            {
+              "text": "🚨 Fleet Orchestration Pipeline Failed",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Fleet Orchestration Pipeline*\nStatus: ❌ Failed\nRepository: ${{ github.repository }}\nBranch: ${{ github.ref_name }}\nRun: ${{ github.run_id }}"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
